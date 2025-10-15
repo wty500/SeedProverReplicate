@@ -91,8 +91,11 @@ class LeanCompiler:
         lines = error_msg.split('\n')
         relevant_lines = []
         for line in lines:
-            if not ('trace:' in line.lower() or 'warning:' in line.lower()):
-                relevant_lines.append(line)
+            if 'set_option linter.docPrime false' in line.lower():
+                raise RuntimeError(line)
+            if 'trace:' in line.lower() or 'warning:' in line.lower() or 'info:' in line.lower() or 'set_option diagnostics true' in line.lower() or 'note:' in line.lower():
+                continue
+            relevant_lines.append(line)
             match = re.search(r'main\.lean:(\d+):', line)
             if match:
                 line_num = int(match.group(1))
@@ -106,7 +109,7 @@ class SeedProver:
     """SeedProver主类"""
 
     def __init__(self, api_key: str, model="gemini-2.5-pro-thinking"):
-        self.client = AsyncOpenAI(api_key=api_key, base_url="http://xxxxxx/v1/")  # 改为异步客户端
+        self.client = AsyncOpenAI(api_key=api_key, base_url="http://xxxxx/v1/")  # 改为异步客户端
         self.model = model
         self.compiler = LeanCompiler()
         self.lemma_pool: List[Lemma] = []
@@ -148,65 +151,178 @@ class SeedProver:
                 proof = refined_proof
         return None
 
-    async def medium_inference(self, statement: str) -> Optional[str]:
-        """Medium推理策略：内外层优化"""
-        # 生成引理并分解问题（保留对话历史）
-        lemmas, lemmas_history, last_lemmas_text = await self._generate_lemmas(statement)
-        logger.info(f"Generated {len(lemmas)} lemmas")
+    async def medium_inference(self, statement: str, initial_lemmas: Optional[List[Lemma]] = None) -> Optional[str]:
+        """
+        Medium 推理流程：
+        1) 先让 LLM 生成整份“whole proof”（若干 lemma + 主定理 main_theorem）。
+        2) 编译失败 → 从这份代码里抽取 fail lemma（按出现的 lemma 解析）。
+        3) 对这些 fail lemma 分别跑 light inference（8×8）得到可用证明，纳入“新上下文”。
+        4) 将“已证引理”作为上下文，重新生成 whole proof。
+        5) 循环往复，直到编译通过或达上限。
+        """
+        import re
+        from typing import Dict
 
-        # 新增：若语法检查失败，将历史对话 + 编译报错回传给 LLM，请其整体修复并重新输出所有引理
-        ok = False
-        max_regen = 6
-        for attempt in range(max_regen):
-            ok, feedback = await self._check_lemmas_syntax(lemmas)
+        # 已证明的引理池（使用传入的引理进行初始化）
+        proved_bank: Dict[str, Lemma] = {lm.name: lm for lm in initial_lemmas if lm.proof} if initial_lemmas else {}
+        if initial_lemmas:
+            logger.info(f"[Medium] Initialized with {len(proved_bank)} externally proved lemmas.")
+
+        # 外层/内层配置
+        outer_rounds = 5
+        inner_parallel = 80
+
+        # 为“whole proof”生成保留一点对话上下文（仅用于该函数内）
+        history: List[Dict[str, str]] = []
+
+        # 与 _create_lean_file 保持一致的头部
+        header = """import Mathlib
+import Aesop
+import Mathlib.Tactic.Ring
+set_option pp.numericTypes true
+set_option pp.funBinderTypes true
+set_option maxHeartbeats 0
+set_option maxRecDepth 1000
+set_option tactic.hygienic false
+open BigOperators Real Nat Topology Rat Classical Polynomial
+    """
+
+        # 简单稳健地抽取 lemma（兼容参数括号与类型冒号；只取“:= by”之前的声明部分，且将冒号包含在声明里）
+        # 解释：
+        # - 组1捕获引理名
+        # - 组2捕获“(参数)/{隐式参数}/[实例]… : 结论”这一整段（包含冒号），避免把参数里的冒号误当成类型冒号
+        lemma_pat = re.compile(
+            r"(?ms)^\s*lemma\s+([A-Za-z_][A-Za-z0-9_']*)\s*((?:[\(\{\[].*?[\)\}\]]\s*)*:\s*.*?)\s*:=\s*by\b"
+        )
+
+        for outer in range(1, outer_rounds + 1):
+            logger.info(f"[Medium] Outer round {outer} — generate whole proof with {len(proved_bank)} proved lemmas as context")
+
+            # 将“已证引理”编码为可直接放入 Lean 文件顶层的代码段
+            context_code = ""
+            if proved_bank:
+                blocks = []
+                for lm in proved_bank.values():
+                    if not lm.proof:
+                        continue
+                    # 注意：这里用于实际 Lean 代码，采用标准 Lean 4 语法（带冒号）
+                    blocks.append(f"lemma {lm.name} {lm.statement} {lm.proof}")
+                context_code = "\n\n".join(blocks)
+
+            proved_lemmas = "\n\t\t".join(f"{lm.name} {lm.statement}" for lm in proved_bank.values()) if proved_bank else "(none)"
+            prompt = f"""You are a Lean 4.14 prover. Produce ONE code block with this structure:
+
+    1) A set of helpful lemmas or intermediate results that would assist in proving the main theorem. Each lemma must be syntactically correct and provable in Lean 4.14 with Mathlib imported. Use valid Lean syntax and avoid Lean 3 notations like `∀`. Do NOT use `sorry` or `admit`. Each lemma should be in the form:
+    `lemma name <variable> : <statement> := by ...`
+    e.g. `lemma my_lemma (x : ℝ) : x + 0 = x := by ring`
+    2) Then finish with the main theorem, named EXACTLY:
+    `theorem main_theorem {statement} := by ...`
+
+    Rules:
+    - Do NOT include any imports/options; only lemmas and the theorem.
+    - Avoid `sorry`/`admit`.
+    - Existing lemmas:
+        {proved_lemmas}
+    Do NOT reuse these names.
+    - You MAY use those existing lemmas as if they are already defined earlier in the file.
+    """
+            msgs = history + [{"role": "user", "content": prompt}]
+            whole_code, full_msg = await self._call_llm(msgs, temperature=0.5)
+            history = msgs + [{"role": "assistant", "content": full_msg}]
+
+            # 组合为可编译的 Lean 文件（把“已证引理”放在生成内容之前）
+            compiled_code = header + (context_code + "\n\n" if context_code else "") + whole_code.strip() + "\n"
+
+            # === 2) 编译 whole proof ===
+            ok, fb = await asyncio.to_thread(self.compiler.compile, compiled_code)
             if ok:
-                logger.info("Lemma syntax check passed.")
-                break
-            logger.warning(f"Lemma syntax invalid, asking LLM to repair... attempt {attempt + 1}/{max_regen}")
-            logger.info(f"Compiler feedback:\n{feedback}")
-            lemmas, lemmas_history, last_lemmas_text = await self._repair_lemmas(
-                statement, lemmas_history, feedback, last_lemmas_text
-            )
+                logger.info("[Medium] Whole proof compiled successfully.")
+                # 将（上下文引理 + LLM 产生的新引理）与主定理体拼接为返回格式：
+                #   preface(仅引理) + '\n' + (':= by ...')
+                # 先从 LLM 产物中切出 main_theorem 的 body
+                m_body = re.search(r"(?ms)^\s*theorem\s+main_theorem\b.*?(?P<body>:=\s*by[\s\S]*)$", whole_code)
+                if not m_body:
+                    # 若 LLM 没按约定命名，兜底为仅用“已证引理”来完成主定理
+                    main_body = await self._prove_with_lemmas(statement, list(proved_bank.values()))
+                    if main_body:
+                        return (context_code + "\n\n" + main_body) if context_code else main_body
+                    return None
 
-        if not ok:
-            logger.error("Failed to obtain a syntactically valid batch of lemmas after repairs. Salvaging individually valid lemmas...")
-            salvaged: List[Lemma] = []
-            for l in lemmas:
-                single_ok, _ = await self._check_lemmas_syntax([l])
-                if single_ok:
-                    salvaged.append(l)
-            lemmas = salvaged
-            logger.info(f"Salvaged {len(lemmas)} syntactically valid lemmas")
+                # 取 LLM 代码里、theorem main_theorem 之前的部分，剔除掉 theorem 头本身（只保留新引理）
+                idx_theorem = re.search(r"(?m)^\s*theorem\s+main_theorem\b", whole_code)
+                preface_llm = whole_code[:idx_theorem.start()] if idx_theorem else ""
+                # 返回值应是：已有上下文引理 + 新生成的引理 + 主定理体（:= by ...）
+                preface_all = "\n\n".join(s for s in [context_code, preface_llm.strip()] if s.strip())
+                body = m_body.group("body").strip()
+                return (preface_all + "\n\n" + body).strip() if preface_all else body
 
-        # 尝试证明每个引理（加入并发限流）
-        proved_lemmas = []
-        sem = asyncio.Semaphore(80)  # 新增：限制并发 LLM 证明任务
+            # 如果编译失败，进入重试循环
+            for attempt in range(8): # 最多重试8次
+                logger.info(f"[Medium] Whole proof failed. Retrying with feedback (Attempt {attempt + 1}/8)...")
+                logger.error("[Error Message]:\n" + "="*25 + f"\n{fb}\n" + "="*25)
 
-        async def prove_lemma_task(lemma: Lemma) -> Optional[Lemma]:
-            """Tries to prove a single lemma and returns it if successful."""
-            async with sem:
-                lemma_proof = await self.light_inference(lemma.statement, max_rounds=2, max_iterations=8)
-                if lemma_proof:
-                    lemma.proof = lemma_proof
-                    return lemma
-            return None
+                # 请求LLM修复证明
+                refine_prompt = f"""The previous Lean 4 proof failed with an error. Please fix it and return ONE Lean 4.14 code block containing the complete proof (lemmas and the main theorem).
+Error message:
+{fb}
+"""
+                refine_msgs = history + [{"role": "user", "content": refine_prompt}]
+                whole_code, full_msg = await self._call_llm(refine_msgs, temperature=0.5)
+                history = refine_msgs + [{"role": "assistant", "content": full_msg}]
 
-        tasks = [prove_lemma_task(lemma) for lemma in lemmas]
-        results = await asyncio.gather(*tasks)
+                # 重新组合并编译
+                compiled_code = header + (context_code + "\n\n" if context_code else "") + whole_code.strip() + "\n"
+                ok, fb = await asyncio.to_thread(self.compiler.compile, compiled_code)
 
-        for proved_lemma in results:
-            if proved_lemma:
-                proved_lemmas.append(proved_lemma)
-                self.lemma_pool.append(proved_lemma)
+                if ok:
+                    logger.info("[Medium] Whole proof compiled successfully after refinement.")
+                    # 成功后的逻辑与上面相同
+                    m_body = re.search(r"(?ms)^\s*theorem\s+main_theorem\b.*?(?P<body>:=\s*by[\s\S]*)$", whole_code)
+                    if not m_body:
+                        main_body = await self._prove_with_lemmas(statement, list(proved_bank.values()))
+                        if main_body:
+                            return (context_code + "\n\n" + main_body) if context_code else main_body
+                        return None
+                    idx_theorem = re.search(r"(?m)^\s*theorem\s+main_theorem\b", whole_code)
+                    preface_llm = whole_code[:idx_theorem.start()] if idx_theorem else ""
+                    preface_all = "\n\n".join(s for s in [context_code, preface_llm.strip()] if s.strip())
+                    body = m_body.group("body").strip()
+                    return (preface_all + "\n\n" + body).strip() if preface_all else body
 
-        logger.info(f"Proved {len(proved_lemmas)} out of {len(lemmas)} lemmas")
+            logger.info("[Medium] Whole proof still failed after 8 retries; extracting candidate fail lemmas...")
+            # === 3) 提取这次 whole proof 中出现的 lemma，选未证明的做 inner light inference ===
+            candidates: List[Lemma] = []
+            seen: Set[str] = set()
+            for m in lemma_pat.finditer(whole_code):
+                name = m.group(1).strip()
+                stmt = m.group(2).strip()
+                if name and stmt and (name not in proved_bank) and (name not in seen):
+                    candidates.append(Lemma(name=name, statement=stmt))
+                    seen.add(name)
 
-        # 使用已证明的引理来证明主命题
-        if proved_lemmas:
-            proof_with_lemmas = await self._prove_with_lemmas(statement, proved_lemmas)
-            if proof_with_lemmas:
-                return self._combine_lemmas_and_proof(proved_lemmas, proof_with_lemmas)
+            if not candidates:
+                logger.info("[Medium] No new lemmas found from this whole proof; continuing to next outer round.")
+                continue
 
+            sem = asyncio.Semaphore(inner_parallel)
+
+            async def prove_one(lm: Lemma) -> Optional[Lemma]:
+                async with sem:
+                    prf = await self.light_inference(lm.statement, max_rounds=1, max_iterations=8)
+                    if prf:
+                        lm.proof = prf  # prf 形如 " := by ..."
+                        return lm
+                    return None
+
+            results = await asyncio.gather(*[prove_one(l) for l in candidates])
+            newly = [r for r in results if r]
+            for lm in newly:
+                proved_bank[lm.name] = lm
+            logger.info(f"[Medium] Inner refinement proved {len(newly)} / {len(candidates)} lemmas.")
+
+            # 进入下一次外层循环，用“新上下文”重新 whole proof（Problem with New Context）
+
+        # 超过外层轮数仍未奏效
         return None
 
     async def heavy_inference(self, statement: str) -> Optional[str]:
@@ -339,7 +455,7 @@ class SeedProver:
             history = []
 
         prompt = f"""You are a Lean 4 theorem prover.
-Please first describe and refine a rigorous proof in natural language, and then Return ONE code block for Lean 4.14 starting with `:= by` and ending with a closing ``` that contains a complete proof for the given statement. Your declaration must not use `sorry` or `admit`. You can use tactics like `aesop`, `ring`, `linarith`, `norm_num`, etc. to help you.
+Please first describe and refine a rigorous proof in natural language, and then Return ONE code block for Lean 4.14 starting with `:= by` and ending with a closing ``` that contains a complete proof for the given statement. Your declaration must not use `sorry` or `admit`. You can use tactics like `aesop`, `ring`, `linarith`, `norm_num`, etc. to help you. They are already imported.
 
 Goal:
 {statement}
@@ -362,6 +478,7 @@ Goal:
             # 创建完整的Lean文件
             lean_code = self._create_lean_file(statement, proof)
 
+            logger.info("Compiling Lean code...")
             # 写入文件并编译（放入线程，避免阻塞事件循环）
             success, feedback = await asyncio.to_thread(self.compiler.compile, lean_code)
 
@@ -430,10 +547,10 @@ Ultimate Goal:
 
 Generate {num_lemmas} lemmas in the following format:
 LEMMA_NAME: <name>
-STATEMENT: <lean4 statement, e.g. (r : ℝ) : Int.floor (r + (1 / 100 : ℝ)) ≤ Int.floor (r + 1)>
+STATEMENT: <lean4 statement, e.g. (r : ℝ) : Int.floor (r + (1 / 100 : ℝ)) ≤ Int.floor (r + 1). A colon should be included(even at the beginning) if applicable, e.g. : Finset.card (Finset.Icc (19 : ℕ) 91) = 73 >
 DESCRIPTION: <brief description>
 
-Separate each lemma with "---". The lemmas should be diverse and explore different aspects of the theorem, and they should be useful for proving the main theorem. The statements should be valid when concatenated like `lemma NAME : {{statement}} := by sorry`. Do not include proofs.
+Separate each lemma with "---". The lemmas should be diverse and explore different aspects of the theorem, and they should be useful for proving the main theorem. The statements should be valid when concatenated like `lemma NAME {{statement}} := by sorry`. Do not include proofs.
 The lean version is Lean 4.14.0. Avoid lean3 syntax like `∀`.
 """
         messages = history + [{"role": "user", "content": prompt}]
@@ -444,7 +561,7 @@ The lean version is Lean 4.14.0. Avoid lean3 syntax like `∀`.
 
     async def _repair_lemmas(self, statement: str, history: List[Dict[str, str]], compiler_feedback: str, last_lemmas_text: str) -> Tuple[List[Lemma], List[Dict[str, str]], str]:
         """在语法检查失败后，将历史对话和编译报错传回LLM，请其整体修复并重新输出完整引理集"""
-        prompt = f"""Your previously proposed lemmas for the goal below failed to type-check in Lean 4.14 when wrapped as `lemma NAME : STATEMENT := by sorry`.
+        prompt = f"""Your previously proposed lemmas for the goal below failed to type-check in Lean 4.14 when wrapped as `lemma NAME STATEMENT := by sorry`.
 
 Goal:
 {statement}
@@ -455,13 +572,13 @@ Compiler feedback:
 Please fix all issues and output a complete replacement batch of 5-10 lemmas in EXACTLY this format:
 
 LEMMA_NAME: <name>
-STATEMENT: <Lean 4.14 statement (the part after the colon in `lemma NAME : ...`)>
+STATEMENT: <Lean 4.14 statement, e.g. (r : ℝ) : Int.floor (r + (1 / 100 : ℝ)) ≤ Int.floor (r + 1). A colon should be included if applicable.>
 DESCRIPTION: <brief description>
 
 Separate lemmas with '---'.
 Requirements:
 - Lean 4.14 syntax only (no Lean 3 notations like `∀`).
-- Each lemma must type-check as `lemma NAME : STATEMENT := by sorry` after importing Mathlib.
+- Each lemma must type-check as `lemma NAME STATEMENT := by sorry` after importing Mathlib.
 - Names must be valid identifiers and unique.
 - Do not include any proofs.
 """
@@ -564,59 +681,19 @@ Example output:
             return [lemma for _, lemma in scored_lemmas[:top_k]]
 
     async def _prove_with_lemmas(self, statement: str, lemmas: List[Lemma], max_retries: int = 8 ) -> Optional[str]:
-        """使用给定的引理证明命题，失败时基于编译反馈进行多次重试"""
-        lemma_context = "\n".join([f"lemma {l.name} : {l.statement}"
-                                   for l in lemmas if l.proof])
-
-        base_prompt = f"""Prove the following theorem. You may use the provided lemmas.
-The necessary headers `import Mathlib` and `import Aesop` are already included.
-
-Available lemmas:
-{lemma_context}
-
-Theorem to prove:
-{statement}
-
-Generate a Lean 4.14.0 proof that may use these lemmas. You can first think carefully and then generate the Lean 4.14.0 proof code. The code should be starting with':= by', and be wrapped in a single ``` ... ``` block. Your declaration must not use `sorry` or `admit`. You should return only ONE block of code.
-"""
-
-        history: List[Dict[str, str]] = []
-        last_proof = ""
-        feedback = ""
-
-        for attempt in range(max_retries):
-            if attempt == 0:
-                messages = history + [{"role": "user", "content": base_prompt}]
-            else:
-                refine_prompt = f"""The previous Lean 4 proof failed to compile. Please fix it and return ONLY one Lean code block starting with ':= by'.
-
-Compiler feedback:
-{feedback}
-"""
-                messages = history + [{"role": "user", "content": refine_prompt}]
-
-            proof, original = await self._call_llm(messages, temperature=0.5)
-            history = messages + [{"role": "assistant", "content": original}]
-            last_proof = proof
-
-            # 验证证明
-            async with self.compile_lock:
-                preface_and_proof = self._combine_lemmas_and_proof(lemmas, proof)
-                lean_code = self._create_lean_file(statement, preface_and_proof)
-                success, feedback = await asyncio.to_thread(self.compiler.compile, lean_code)  # 放入线程
-                logger.info(f"[Attempt {attempt + 1}] Feedback:\n{feedback}")
-
-            if success:
-                return proof
-
-        return None
+        """
+        使用给定的引理通过 medium_inference 策略来证明命题。
+        """
+        logger.info(f"Delegating proof with {len(lemmas)} lemmas to medium_inference strategy.")
+        # 调用 medium_inference，并将已证明的引理作为初始上下文传入
+        return await self.medium_inference(statement, initial_lemmas=lemmas)
 
     def _combine_lemmas_and_proof(self, lemmas: List[Lemma], main_proof: str) -> str:
         """组合引理和主证明为一个字符串（前置若干 lemma 声明 + 主定理证明片段）。"""
         lemma_proofs = []
         for lemma in lemmas:
             if lemma.proof:
-                lemma_proofs.append(f"lemma {lemma.name} : {lemma.statement} {lemma.proof}")
+                lemma_proofs.append(f"lemma {lemma.name}{lemma.statement} {lemma.proof}")
         preface = "\n".join(lemma_proofs).strip()
         if preface:
             return preface + "\n\n" + main_proof.strip()
@@ -636,7 +713,6 @@ set_option pp.funBinderTypes true
 set_option maxHeartbeats 0
 set_option maxRecDepth 1000
 set_option tactic.hygienic false
-set_option diagnostics true
 open BigOperators Real Nat Topology Rat Classical Polynomial
 """
         # 将 proof 拆分为「前置顶层声明」与「主定理证明片段（:= by ...）」。
@@ -663,7 +739,6 @@ set_option pp.funBinderTypes true
 set_option maxHeartbeats 0
 set_option maxRecDepth 1000
 set_option tactic.hygienic false
-set_option diagnostics true
 open BigOperators Real Nat Topology Rat Classical Polynomial
 """
         bodies: List[str] = []
@@ -695,7 +770,7 @@ async def main():
     strategy = "heavy"  # sys.argv[2] if len(sys.argv) > 2 else "medium"
 
     # 从环境变量获取API密钥
-    api_key = "keyhere"  # os.getenv("OPENAI_API_KEY")
+    api_key = "sk-xxxxxx"  # os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.error("Please set OPENAI_API_KEY environment variable")
         sys.exit(1)
