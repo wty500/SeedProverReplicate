@@ -108,8 +108,8 @@ class LeanCompiler:
 class SeedProver:
     """SeedProver主类"""
 
-    def __init__(self, api_key: str, model="gemini-2.5-pro-thinking"):
-        self.client = AsyncOpenAI(api_key=api_key, base_url="http://xxxxx/v1/")  # 改为异步客户端
+    def __init__(self, api_key: str, model="gpt-5"):
+        self.client = AsyncOpenAI(api_key=api_key, base_url="http://xxxx/v1/")  # 改为异步客户端
         self.model = model
         self.compiler = LeanCompiler()
         self.lemma_pool: List[Lemma] = []
@@ -237,24 +237,7 @@ open BigOperators Real Nat Topology Rat Classical Polynomial
             ok, fb = await asyncio.to_thread(self.compiler.compile, compiled_code)
             if ok:
                 logger.info("[Medium] Whole proof compiled successfully.")
-                # 将（上下文引理 + LLM 产生的新引理）与主定理体拼接为返回格式：
-                #   preface(仅引理) + '\n' + (':= by ...')
-                # 先从 LLM 产物中切出 main_theorem 的 body
-                m_body = re.search(r"(?ms)^\s*theorem\s+main_theorem\b.*?(?P<body>:=\s*by[\s\S]*)$", whole_code)
-                if not m_body:
-                    # 若 LLM 没按约定命名，兜底为仅用“已证引理”来完成主定理
-                    main_body = await self._prove_with_lemmas(statement, list(proved_bank.values()))
-                    if main_body:
-                        return (context_code + "\n\n" + main_body) if context_code else main_body
-                    return None
-
-                # 取 LLM 代码里、theorem main_theorem 之前的部分，剔除掉 theorem 头本身（只保留新引理）
-                idx_theorem = re.search(r"(?m)^\s*theorem\s+main_theorem\b", whole_code)
-                preface_llm = whole_code[:idx_theorem.start()] if idx_theorem else ""
-                # 返回值应是：已有上下文引理 + 新生成的引理 + 主定理体（:= by ...）
-                preface_all = "\n\n".join(s for s in [context_code, preface_llm.strip()] if s.strip())
-                body = m_body.group("body").strip()
-                return (preface_all + "\n\n" + body).strip() if preface_all else body
+                return compiled_code
 
             # 如果编译失败，进入重试循环
             for attempt in range(8): # 最多重试8次
@@ -276,18 +259,7 @@ Error message:
 
                 if ok:
                     logger.info("[Medium] Whole proof compiled successfully after refinement.")
-                    # 成功后的逻辑与上面相同
-                    m_body = re.search(r"(?ms)^\s*theorem\s+main_theorem\b.*?(?P<body>:=\s*by[\s\S]*)$", whole_code)
-                    if not m_body:
-                        main_body = await self._prove_with_lemmas(statement, list(proved_bank.values()))
-                        if main_body:
-                            return (context_code + "\n\n" + main_body) if context_code else main_body
-                        return None
-                    idx_theorem = re.search(r"(?m)^\s*theorem\s+main_theorem\b", whole_code)
-                    preface_llm = whole_code[:idx_theorem.start()] if idx_theorem else ""
-                    preface_all = "\n\n".join(s for s in [context_code, preface_llm.strip()] if s.strip())
-                    body = m_body.group("body").strip()
-                    return (preface_all + "\n\n" + body).strip() if preface_all else body
+                    return compiled_code
 
             logger.info("[Medium] Whole proof still failed after 8 retries; extracting candidate fail lemmas...")
             # === 3) 提取这次 whole proof 中出现的 lemma，选未证明的做 inner light inference ===
@@ -423,7 +395,7 @@ Error message:
             relevant_lemmas = await self._select_relevant_lemmas(statement, proved_lemmas, top_k=30)
             final_proof = await self._prove_with_lemmas(statement, relevant_lemmas)
             if final_proof:
-                return self._combine_lemmas_and_proof(relevant_lemmas, final_proof)
+                return final_proof
 
         return None
 
@@ -435,13 +407,19 @@ Error message:
             Tuple[str, str]: 一个元组，第一个元素是提取出的Lean代码，第二个元素是LLM返回的原始完整内容。
         """
         while True:
-            response = await self.client.chat.completions.create(  # 变为真正的异步调用
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                timeout=3000,
-            )
+            try:
+                response = await self.client.chat.completions.create(  # 变为真正的异步调用
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    timeout=3000,
+                )
+            except Exception as e:
+                logger.error(f"LLM call failed with error: {e}. Retrying...")
+                continue  # Retry the loop
             content = response.choices[0].message.content.strip()
+            # Remove segments wrapped by <think>...</think> if present
+            content = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
             logger.info("\n[LLM Generated Proof]:\n" + "="*25 + f"\n{content}\n" + "="*25)
             matches = re.findall(r"```(?:lean)?\s*([\s\S]*?)\s*```", content)
             extracted_code = content
@@ -455,7 +433,7 @@ Error message:
             history = []
 
         prompt = f"""You are a Lean 4 theorem prover.
-Please first describe and refine a rigorous proof in natural language, and then Return ONE code block for Lean 4.14 starting with `:= by` and ending with a closing ``` that contains a complete proof for the given statement. Your declaration must not use `sorry` or `admit`. You can use tactics like `aesop`, `ring`, `linarith`, `norm_num`, etc. to help you. They are already imported.
+Please first describe and refine a rigorous proof in natural language, and then Return ONE code block for Lean 4.14 starting with ```:= by and ending with a closing ``` that contains a complete proof for the given statement. Your declaration must not use `sorry` or `admit`. You can use tactics like `aesop`, `ring`, `linarith`, `norm_num`, etc. to help you. They are already imported.
 
 Goal:
 {statement}
@@ -765,12 +743,12 @@ async def main():
     #     logger.info("Usage: python main.py '<lean4_statement>' [strategy]")
     #     sys.exit(1)
 
-    statement = """(r : ℝ) (h₀ : (∑ k in Finset.Icc (19 : ℕ) 91, Int.floor (r + k / 100)) = 546) :
-    Int.floor (100 * r) = 743"""  # sys.argv[1]
+    statement = """(n : ℕ) (h₀ : 0 < n) (h₁ : Finset.card (Nat.divisors (2 * n)) = 28)
+    (h₂ : Finset.card (Nat.divisors (3 * n)) = 30) : Finset.card (Nat.divisors (6 * n)) = 35"""  # sys.argv[1]
     strategy = "heavy"  # sys.argv[2] if len(sys.argv) > 2 else "medium"
 
     # 从环境变量获取API密钥
-    api_key = "sk-xxxxxx"  # os.getenv("OPENAI_API_KEY")
+    api_key = "sk-xxxx"  # os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.error("Please set OPENAI_API_KEY environment variable")
         sys.exit(1)
